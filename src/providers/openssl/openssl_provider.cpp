@@ -5,10 +5,8 @@
 #include <stdexcept>
 #include <utility>
 
-#include <openssl/ec.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/obj_mac.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 
@@ -48,6 +46,49 @@ const EVP_MD* ResolveSignatureDigest(security::core::SignatureAlgorithm algorith
 
 bool IsSm2Algorithm(security::core::SignatureAlgorithm algorithm) {
     return algorithm == security::core::SignatureAlgorithm::SM2_SM3;
+}
+
+EvpPkeyPtr GenerateKeyWithContext(EVP_PKEY_CTX* ctx, const char* error_prefix) {
+    if (!ctx) {
+        ThrowOpenSslError(std::string(error_prefix) + " context creation failed");
+    }
+
+    if (EVP_PKEY_keygen_init(ctx) != 1) {
+        ThrowOpenSslError(std::string(error_prefix) + " keygen init failed");
+    }
+
+    EVP_PKEY* raw = nullptr;
+    if (EVP_PKEY_keygen(ctx, &raw) != 1) {
+        ThrowOpenSslError(std::string(error_prefix) + " key generation failed");
+    }
+
+    return EvpPkeyPtr(raw, &EVP_PKEY_free);
+}
+
+EvpPkeyPtr GenerateRsaKey(int bits) {
+    EvpPkeyCtxPtr ctx(EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr), &EVP_PKEY_CTX_free);
+    if (!ctx) {
+        ThrowOpenSslError("failed to create RSA keygen context");
+    }
+
+    if (EVP_PKEY_keygen_init(ctx.get()) != 1) {
+        ThrowOpenSslError("RSA keygen init failed");
+    }
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx.get(), bits) != 1) {
+        ThrowOpenSslError("failed to set RSA key size");
+    }
+
+    EVP_PKEY* raw = nullptr;
+    if (EVP_PKEY_keygen(ctx.get(), &raw) != 1) {
+        ThrowOpenSslError("RSA key generation failed");
+    }
+
+    return EvpPkeyPtr(raw, &EVP_PKEY_free);
+}
+
+EvpPkeyPtr GenerateSm2Key() {
+    EvpPkeyCtxPtr ctx(EVP_PKEY_CTX_new_from_name(nullptr, "SM2", nullptr), &EVP_PKEY_CTX_free);
+    return GenerateKeyWithContext(ctx.get(), "SM2");
 }
 
 security::core::KeyPairPem ExportPem(EVP_PKEY* pkey) {
@@ -136,42 +177,12 @@ public:
 
     security::core::KeyPairPem GenerateKeyPair(security::core::KeyAlgorithm algorithm, int bits) const override {
         if (algorithm == security::core::KeyAlgorithm::RSA) {
-            EvpPkeyCtxPtr ctx(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), &EVP_PKEY_CTX_free);
-            if (!ctx) {
-                ThrowOpenSslError("failed to create RSA keygen context");
-            }
-
-            if (EVP_PKEY_keygen_init(ctx.get()) != 1) {
-                ThrowOpenSslError("RSA keygen init failed");
-            }
-            if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx.get(), bits) != 1) {
-                ThrowOpenSslError("failed to set RSA key size");
-            }
-
-            EVP_PKEY* raw = nullptr;
-            if (EVP_PKEY_keygen(ctx.get(), &raw) != 1) {
-                ThrowOpenSslError("RSA key generation failed");
-            }
-            EvpPkeyPtr key(raw, &EVP_PKEY_free);
+            EvpPkeyPtr key = GenerateRsaKey(bits);
             return ExportPem(key.get());
         }
 
         if (algorithm == security::core::KeyAlgorithm::SM2) {
-            std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)> ec_key(EC_KEY_new_by_curve_name(NID_sm2), &EC_KEY_free);
-            if (!ec_key) {
-                ThrowOpenSslError("failed to create SM2 EC key");
-            }
-            if (EC_KEY_generate_key(ec_key.get()) != 1) {
-                ThrowOpenSslError("SM2 key generation failed");
-            }
-
-            EvpPkeyPtr key(EVP_PKEY_new(), &EVP_PKEY_free);
-            if (!key) {
-                ThrowOpenSslError("failed to create EVP_PKEY for SM2");
-            }
-            if (EVP_PKEY_assign_EC_KEY(key.get(), ec_key.release()) != 1) {
-                ThrowOpenSslError("failed to assign SM2 key to EVP_PKEY");
-            }
+            EvpPkeyPtr key = GenerateSm2Key();
             return ExportPem(key.get());
         }
 
