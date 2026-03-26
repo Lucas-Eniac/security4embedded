@@ -41,6 +41,8 @@ int main() {
         const auto provider_info = module->GetProviderInfo("openssl");
         Assert(provider_info.name == "openssl", "provider name mismatch");
         Assert(!provider_info.version.empty(), "provider version is empty");
+        Assert(provider_info.sn.empty(), "provider SN should be empty for OpenSSL validation backend");
+        Assert(provider_info.userdata_capability == 4096, "provider userdata capability mismatch");
 
         const auto sample = ToBytes("abc");
 
@@ -62,8 +64,17 @@ int main() {
             provider->Verify(security::core::SignatureAlgorithm::SM2_SM3, sm2_keys.public_key_pem, sample, sm2_sig),
             "SM2 verify failed");
 
-        std::cout << "Provider: " << provider_info.name << " | Version: " << provider_info.version << std::endl;
-        std::cout << "Validation passed: SHA256/SM3 digest and RSA/SM2 sign verify are successful." << std::endl;
+        const auto user_data = ToBytes("userdata-demo");
+        provider->WriteUserData(32, user_data.size(), user_data);
+        const auto loaded_user_data = provider->ReadUserData(32, user_data.size());
+        Assert(loaded_user_data == user_data, "user data read/write mismatch");
+
+        std::cout << "Provider: " << provider_info.name
+              << " | Version: " << provider_info.version
+              << " | SN: " << (provider_info.sn.empty() ? "<empty>" : provider_info.sn)
+              << " | UserDataCapability: " << provider_info.userdata_capability
+              << std::endl;
+        std::cout << "Validation passed: SHA256/SM3 digest, RSA/SM2 sign verify, and 4KB user data storage access are successful." << std::endl;
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "Validation failed: " << ex.what() << std::endl;

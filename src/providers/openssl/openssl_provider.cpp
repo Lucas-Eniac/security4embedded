@@ -1,6 +1,10 @@
 #include "providers/openssl/openssl_provider.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -21,6 +25,8 @@ using EvpPkeyCtxPtr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)
 using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
 
 constexpr const char* kDefaultSm2Id = "1234567812345678";
+constexpr std::size_t kUserDataSizeBytes = 4 * 1024;
+constexpr const char* kUserDataFilePath = "/tmp/openssl_userdata.bin";
 
 const EVP_MD* ResolveDigest(security::core::DigestAlgorithm algorithm) {
     switch (algorithm) {
@@ -46,6 +52,82 @@ const EVP_MD* ResolveSignatureDigest(security::core::SignatureAlgorithm algorith
 
 bool IsSm2Algorithm(security::core::SignatureAlgorithm algorithm) {
     return algorithm == security::core::SignatureAlgorithm::SM2_SM3;
+}
+
+void ValidateUserDataRange(std::size_t offset, std::size_t length) {
+    if (offset > kUserDataSizeBytes || length > kUserDataSizeBytes - offset) {
+        throw std::out_of_range("user data access exceeds 4KB storage size");
+    }
+}
+
+void EnsureUserDataFile() {
+    namespace fs = std::filesystem;
+
+    const fs::path path(kUserDataFilePath);
+    if (!fs::exists(path)) {
+        std::ofstream create_stream(path, std::ios::binary | std::ios::trunc);
+        if (!create_stream) {
+            throw std::runtime_error("failed to create OpenSSL user data file");
+        }
+
+        security::core::ByteBuffer zeros(kUserDataSizeBytes, 0);
+        create_stream.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+        if (!create_stream) {
+            throw std::runtime_error("failed to initialize OpenSSL user data file");
+        }
+        return;
+    }
+
+    const auto file_size = fs::file_size(path);
+    if (file_size != kUserDataSizeBytes) {
+        throw std::runtime_error("OpenSSL user data file size is invalid; expected 4096 bytes");
+    }
+}
+
+security::core::ByteBuffer ReadUserDataFromFile(std::size_t offset, std::size_t length) {
+    ValidateUserDataRange(offset, length);
+    EnsureUserDataFile();
+
+    std::ifstream input(kUserDataFilePath, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("failed to open OpenSSL user data file for reading");
+    }
+
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!input) {
+        throw std::runtime_error("failed to seek OpenSSL user data file for reading");
+    }
+
+    security::core::ByteBuffer data(length);
+    input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(length));
+    if (input.gcount() != static_cast<std::streamsize>(length)) {
+        throw std::runtime_error("failed to read requested OpenSSL user data range");
+    }
+    return data;
+}
+
+void WriteUserDataToFile(std::size_t offset, std::size_t length, const security::core::ByteBuffer& data) {
+    if (data.size() != length) {
+        throw std::invalid_argument("user data write length does not match buffer size");
+    }
+
+    ValidateUserDataRange(offset, length);
+    EnsureUserDataFile();
+
+    std::fstream output(kUserDataFilePath, std::ios::binary | std::ios::in | std::ios::out);
+    if (!output) {
+        throw std::runtime_error("failed to open OpenSSL user data file for writing");
+    }
+
+    output.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!output) {
+        throw std::runtime_error("failed to seek OpenSSL user data file for writing");
+    }
+
+    output.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(length));
+    if (!output) {
+        throw std::runtime_error("failed to write requested OpenSSL user data range");
+    }
 }
 
 EvpPkeyPtr GenerateKeyWithContext(EVP_PKEY_CTX* ctx, const char* error_prefix) {
@@ -156,6 +238,8 @@ public:
         security::core::ProviderInfo info;
         info.name = "openssl";
         info.version = OpenSSL_version(OPENSSL_VERSION);
+        info.sn = {};
+        info.userdata_capability = static_cast<std::uint32_t>(kUserDataSizeBytes);
         return info;
     }
 
@@ -220,6 +304,14 @@ public:
         }
         signature.resize(sig_len);
         return signature;
+    }
+
+    security::core::ByteBuffer ReadUserData(std::size_t offset, std::size_t length) const override {
+        return ReadUserDataFromFile(offset, length);
+    }
+
+    void WriteUserData(std::size_t offset, std::size_t length, const security::core::ByteBuffer& data) const override {
+        WriteUserDataToFile(offset, length, data);
     }
 
     bool Verify(

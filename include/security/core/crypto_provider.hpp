@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,6 +24,10 @@ public:
         SignatureAlgorithm algorithm,
         std::string_view private_key_pem,
         const ByteBuffer& data) const = 0;
+
+    virtual ByteBuffer ReadUserData(std::size_t offset, std::size_t length) const = 0;
+
+    virtual void WriteUserData(std::size_t offset, std::size_t length, const ByteBuffer& data) const = 0;
 
     virtual bool Verify(
         SignatureAlgorithm algorithm,

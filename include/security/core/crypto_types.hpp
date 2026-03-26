@@ -31,6 +31,8 @@ struct KeyPairPem {
 struct ProviderInfo {
     std::string name;
     std::string version;
+    std::string sn;
+    std::uint32_t userdata_capability = 0;
 };
 
 } // namespace security::core
