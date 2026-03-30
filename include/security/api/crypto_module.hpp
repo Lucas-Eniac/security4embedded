@@ -14,11 +14,11 @@ class ICryptoModule {
 public:
     virtual ~ICryptoModule() = default;
 
-    virtual std::unique_ptr<security::core::ICryptoProvider> CreateProvider(std::string_view backend) const = 0;
-    virtual security::core::ProviderInfo GetProviderInfo(std::string_view backend) const = 0;
-    virtual std::vector<std::string> ListProviders() const = 0;
+    virtual security::core::Result<std::unique_ptr<security::core::ICryptoProvider>> CreateProvider(std::string_view backend) const = 0;
+    virtual security::core::Result<security::core::ProviderInfo> GetProviderInfo(std::string_view backend) const = 0;
+    virtual security::core::Result<std::vector<std::string>> ListProviders() const = 0;
 };
 
-SECURITY_MODULE_EXPORT std::unique_ptr<ICryptoModule> CreateCryptoModule();
+SECURITY_MODULE_EXPORT security::core::Result<std::unique_ptr<ICryptoModule>> CreateCryptoModule();
 
 } // namespace security::api

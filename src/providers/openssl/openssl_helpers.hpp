@@ -1,7 +1,8 @@
 #pragma once
 
-#include <stdexcept>
 #include <string>
+
+#include "core/error_utils.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -26,9 +27,11 @@ inline std::string GetOpenSslErrorString() {
 inline void ThrowOpenSslError(const std::string& message) {
     const std::string details = GetOpenSslErrorString();
     if (details.empty()) {
-        throw std::runtime_error(message);
+        throw security::core::detail::StatusException(security::core::ErrorCode::CryptoBackendError, message);
     }
-    throw std::runtime_error(message + ": " + details);
+    throw security::core::detail::StatusException(
+        security::core::ErrorCode::CryptoBackendError,
+        message + ": " + details);
 }
 
 inline std::string ReadBioToString(BIO* bio) {

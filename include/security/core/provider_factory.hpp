@@ -14,11 +14,11 @@ class ProviderRegistry {
 public:
     static ProviderRegistry& Instance();
 
-    void RegisterFactory(std::unique_ptr<ICryptoProviderFactory> factory);
+    Status RegisterFactory(std::unique_ptr<ICryptoProviderFactory> factory);
 
-    std::unique_ptr<ICryptoProvider> CreateProvider(const std::string& backend_name) const;
+    Result<std::unique_ptr<ICryptoProvider>> CreateProvider(const std::string& backend_name) const;
 
-    std::vector<std::string> ListProviders() const;
+    Result<std::vector<std::string>> ListProviders() const;
 
 private:
     ProviderRegistry() = default;

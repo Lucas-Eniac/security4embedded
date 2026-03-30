@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <openssl/crypto.h>
@@ -14,6 +19,7 @@
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 
+#include "core/error_utils.hpp"
 #include "providers/openssl/openssl_helpers.hpp"
 
 namespace security::providers::openssl_impl {
@@ -23,6 +29,7 @@ using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
 using EvpPkeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 using EvpPkeyCtxPtr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
 using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+using SharedEvpPkeyPtr = std::shared_ptr<EVP_PKEY>;
 
 constexpr const char* kDefaultSm2Id = "1234567812345678";
 constexpr std::size_t kUserDataSizeBytes = 4 * 1024;
@@ -35,7 +42,9 @@ const EVP_MD* ResolveDigest(security::core::DigestAlgorithm algorithm) {
         case security::core::DigestAlgorithm::SM3:
             return EVP_sm3();
         default:
-            throw std::invalid_argument("unsupported digest algorithm");
+            throw security::core::detail::StatusException(
+                security::core::ErrorCode::UnsupportedAlgorithm,
+                "digest algorithm is not supported by the OpenSSL backend");
     }
 }
 
@@ -46,7 +55,9 @@ const EVP_MD* ResolveSignatureDigest(security::core::SignatureAlgorithm algorith
         case security::core::SignatureAlgorithm::SM2_SM3:
             return EVP_sm3();
         default:
-            throw std::invalid_argument("unsupported signature algorithm");
+            throw security::core::detail::StatusException(
+                security::core::ErrorCode::UnsupportedAlgorithm,
+                "signature algorithm is not supported by the OpenSSL backend");
     }
 }
 
@@ -56,7 +67,9 @@ bool IsSm2Algorithm(security::core::SignatureAlgorithm algorithm) {
 
 void ValidateUserDataRange(std::size_t offset, std::size_t length) {
     if (offset > kUserDataSizeBytes || length > kUserDataSizeBytes - offset) {
-        throw std::out_of_range("user data access exceeds 4KB storage size");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::OutOfRange,
+            "user data access exceeds 4KB storage size");
     }
 }
 
@@ -67,20 +80,26 @@ void EnsureUserDataFile() {
     if (!fs::exists(path)) {
         std::ofstream create_stream(path, std::ios::binary | std::ios::trunc);
         if (!create_stream) {
-            throw std::runtime_error("failed to create OpenSSL user data file");
+            throw security::core::detail::StatusException(
+                security::core::ErrorCode::StorageIoError,
+                "failed to create OpenSSL user data file");
         }
 
         security::core::ByteBuffer zeros(kUserDataSizeBytes, 0);
         create_stream.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
         if (!create_stream) {
-            throw std::runtime_error("failed to initialize OpenSSL user data file");
+            throw security::core::detail::StatusException(
+                security::core::ErrorCode::StorageIoError,
+                "failed to initialize OpenSSL user data file");
         }
         return;
     }
 
     const auto file_size = fs::file_size(path);
     if (file_size != kUserDataSizeBytes) {
-        throw std::runtime_error("OpenSSL user data file size is invalid; expected 4096 bytes");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "OpenSSL user data file size is invalid; expected 4096 bytes");
     }
 }
 
@@ -90,25 +109,33 @@ security::core::ByteBuffer ReadUserDataFromFile(std::size_t offset, std::size_t 
 
     std::ifstream input(kUserDataFilePath, std::ios::binary);
     if (!input) {
-        throw std::runtime_error("failed to open OpenSSL user data file for reading");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "failed to open OpenSSL user data file for reading");
     }
 
     input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!input) {
-        throw std::runtime_error("failed to seek OpenSSL user data file for reading");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "failed to seek OpenSSL user data file for reading");
     }
 
     security::core::ByteBuffer data(length);
     input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(length));
     if (input.gcount() != static_cast<std::streamsize>(length)) {
-        throw std::runtime_error("failed to read requested OpenSSL user data range");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "failed to read requested OpenSSL user data range");
     }
     return data;
 }
 
 void WriteUserDataToFile(std::size_t offset, std::size_t length, const security::core::ByteBuffer& data) {
     if (data.size() != length) {
-        throw std::invalid_argument("user data write length does not match buffer size");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::InvalidArgument,
+            "user data write length does not match buffer size");
     }
 
     ValidateUserDataRange(offset, length);
@@ -116,17 +143,23 @@ void WriteUserDataToFile(std::size_t offset, std::size_t length, const security:
 
     std::fstream output(kUserDataFilePath, std::ios::binary | std::ios::in | std::ios::out);
     if (!output) {
-        throw std::runtime_error("failed to open OpenSSL user data file for writing");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "failed to open OpenSSL user data file for writing");
     }
 
     output.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!output) {
-        throw std::runtime_error("failed to seek OpenSSL user data file for writing");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "failed to seek OpenSSL user data file for writing");
     }
 
     output.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(length));
     if (!output) {
-        throw std::runtime_error("failed to write requested OpenSSL user data range");
+        throw security::core::detail::StatusException(
+            security::core::ErrorCode::StorageIoError,
+            "failed to write requested OpenSSL user data range");
     }
 }
 
@@ -193,32 +226,6 @@ security::core::KeyPairPem ExportPem(EVP_PKEY* pkey) {
     return pair;
 }
 
-EvpPkeyPtr LoadPrivateKey(std::string_view private_key_pem) {
-    BioPtr bio(BIO_new_mem_buf(private_key_pem.data(), static_cast<int>(private_key_pem.size())), &BIO_free);
-    if (!bio) {
-        ThrowOpenSslError("failed to create BIO for private key");
-    }
-
-    EVP_PKEY* raw = PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr);
-    if (!raw) {
-        ThrowOpenSslError("failed to parse private key PEM");
-    }
-    return EvpPkeyPtr(raw, &EVP_PKEY_free);
-}
-
-EvpPkeyPtr LoadPublicKey(std::string_view public_key_pem) {
-    BioPtr bio(BIO_new_mem_buf(public_key_pem.data(), static_cast<int>(public_key_pem.size())), &BIO_free);
-    if (!bio) {
-        ThrowOpenSslError("failed to create BIO for public key");
-    }
-
-    EVP_PKEY* raw = PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr);
-    if (!raw) {
-        ThrowOpenSslError("failed to parse public key PEM");
-    }
-    return EvpPkeyPtr(raw, &EVP_PKEY_free);
-}
-
 void SetSm2IdIfNeeded(EVP_PKEY_CTX* pkey_ctx, security::core::SignatureAlgorithm algorithm) {
     if (!IsSm2Algorithm(algorithm)) {
         return;
@@ -230,121 +237,185 @@ void SetSm2IdIfNeeded(EVP_PKEY_CTX* pkey_ctx, security::core::SignatureAlgorithm
 
 class OpenSslProvider final : public security::core::ICryptoProvider {
 public:
-    std::string Name() const override {
-        return "openssl";
+    security::core::Result<std::string> Name() const override {
+        return security::core::Result<std::string>::Success("openssl");
     }
 
-    security::core::ProviderInfo GetProviderInfo() const override {
+    security::core::Result<security::core::ProviderInfo> GetProviderInfo() const override {
         security::core::ProviderInfo info;
         info.name = "openssl";
         info.version = OpenSSL_version(OPENSSL_VERSION);
         info.sn = {};
         info.userdata_capability = static_cast<std::uint32_t>(kUserDataSizeBytes);
-        return info;
+        return security::core::Result<security::core::ProviderInfo>::Success(std::move(info));
     }
 
-    security::core::ByteBuffer Digest(
+    security::core::Result<security::core::ByteBuffer> Digest(
         security::core::DigestAlgorithm algorithm,
         const security::core::ByteBuffer& data) const override {
-        const EVP_MD* md = ResolveDigest(algorithm);
+        try {
+            const EVP_MD* md = ResolveDigest(algorithm);
 
-        unsigned int digest_len = EVP_MD_size(md);
-        security::core::ByteBuffer digest(digest_len);
+            unsigned int digest_len = EVP_MD_size(md);
+            security::core::ByteBuffer digest(digest_len);
 
-        if (EVP_Digest(data.data(), data.size(), digest.data(), &digest_len, md, nullptr) != 1) {
-            ThrowOpenSslError("digest calculation failed");
+            if (EVP_Digest(data.data(), data.size(), digest.data(), &digest_len, md, nullptr) != 1) {
+                ThrowOpenSslError("digest calculation failed");
+            }
+
+            digest.resize(digest_len);
+            return security::core::Result<security::core::ByteBuffer>::Success(std::move(digest));
+        } catch (...) {
+            return security::core::detail::ResultFromCurrentException<security::core::ByteBuffer>();
         }
-
-        digest.resize(digest_len);
-        return digest;
     }
 
-    security::core::KeyPairPem GenerateKeyPair(security::core::KeyAlgorithm algorithm, int bits) const override {
-        if (algorithm == security::core::KeyAlgorithm::RSA) {
-            EvpPkeyPtr key = GenerateRsaKey(bits);
-            return ExportPem(key.get());
-        }
+    security::core::Result<security::core::KeyPairPem> GenerateKeyPair(
+        security::core::KeyAlgorithm algorithm,
+        int bits,
+        std::string& id) const override {
+        try {
+            id.clear();
+            EvpPkeyPtr key(nullptr, &EVP_PKEY_free);
 
-        if (algorithm == security::core::KeyAlgorithm::SM2) {
-            EvpPkeyPtr key = GenerateSm2Key();
-            return ExportPem(key.get());
-        }
+            if (algorithm == security::core::KeyAlgorithm::RSA) {
+                key = GenerateRsaKey(bits);
+            } else if (algorithm == security::core::KeyAlgorithm::SM2) {
+                key = GenerateSm2Key();
+            } else {
+                throw security::core::detail::StatusException(
+                    security::core::ErrorCode::UnsupportedAlgorithm,
+                    "key algorithm is not supported by the OpenSSL backend");
+            }
 
-        throw std::invalid_argument("unsupported key algorithm");
+            auto pair = ExportPem(key.get());
+            id = StoreKeyPair(std::move(key));
+            return security::core::Result<security::core::KeyPairPem>::Success(std::move(pair));
+        } catch (...) {
+            id.clear();
+            return security::core::detail::ResultFromCurrentException<security::core::KeyPairPem>();
+        }
     }
 
-    security::core::ByteBuffer Sign(
+    security::core::Result<security::core::ByteBuffer> Sign(
         security::core::SignatureAlgorithm algorithm,
-        std::string_view private_key_pem,
+        std::string_view id,
         const security::core::ByteBuffer& data) const override {
-        EvpPkeyPtr key = LoadPrivateKey(private_key_pem);
-        EvpMdCtxPtr md_ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
-        if (!md_ctx) {
-            ThrowOpenSslError("failed to create sign context");
-        }
+        try {
+            SharedEvpPkeyPtr key = LookupKeyPair(id);
+            EvpMdCtxPtr md_ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+            if (!md_ctx) {
+                ThrowOpenSslError("failed to create sign context");
+            }
 
-        EVP_PKEY_CTX* pkey_ctx = nullptr;
-        if (EVP_DigestSignInit(md_ctx.get(), &pkey_ctx, ResolveSignatureDigest(algorithm), nullptr, key.get()) != 1) {
-            ThrowOpenSslError("DigestSignInit failed");
-        }
-        SetSm2IdIfNeeded(pkey_ctx, algorithm);
+            EVP_PKEY_CTX* pkey_ctx = nullptr;
+            if (EVP_DigestSignInit(md_ctx.get(), &pkey_ctx, ResolveSignatureDigest(algorithm), nullptr, key.get()) != 1) {
+                ThrowOpenSslError("DigestSignInit failed");
+            }
+            SetSm2IdIfNeeded(pkey_ctx, algorithm);
 
-        if (EVP_DigestSignUpdate(md_ctx.get(), data.data(), data.size()) != 1) {
-            ThrowOpenSslError("DigestSignUpdate failed");
-        }
+            if (EVP_DigestSignUpdate(md_ctx.get(), data.data(), data.size()) != 1) {
+                ThrowOpenSslError("DigestSignUpdate failed");
+            }
 
-        size_t sig_len = 0;
-        if (EVP_DigestSignFinal(md_ctx.get(), nullptr, &sig_len) != 1) {
-            ThrowOpenSslError("DigestSignFinal length query failed");
-        }
+            size_t sig_len = 0;
+            if (EVP_DigestSignFinal(md_ctx.get(), nullptr, &sig_len) != 1) {
+                ThrowOpenSslError("DigestSignFinal length query failed");
+            }
 
-        security::core::ByteBuffer signature(sig_len);
-        if (EVP_DigestSignFinal(md_ctx.get(), signature.data(), &sig_len) != 1) {
-            ThrowOpenSslError("DigestSignFinal failed");
+            security::core::ByteBuffer signature(sig_len);
+            if (EVP_DigestSignFinal(md_ctx.get(), signature.data(), &sig_len) != 1) {
+                ThrowOpenSslError("DigestSignFinal failed");
+            }
+            signature.resize(sig_len);
+            return security::core::Result<security::core::ByteBuffer>::Success(std::move(signature));
+        } catch (...) {
+            return security::core::detail::ResultFromCurrentException<security::core::ByteBuffer>();
         }
-        signature.resize(sig_len);
-        return signature;
     }
 
-    security::core::ByteBuffer ReadUserData(std::size_t offset, std::size_t length) const override {
-        return ReadUserDataFromFile(offset, length);
+    security::core::Result<security::core::ByteBuffer> ReadUserData(std::size_t offset, std::size_t length) const override {
+        try {
+            return security::core::Result<security::core::ByteBuffer>::Success(ReadUserDataFromFile(offset, length));
+        } catch (...) {
+            return security::core::detail::ResultFromCurrentException<security::core::ByteBuffer>();
+        }
     }
 
-    void WriteUserData(std::size_t offset, std::size_t length, const security::core::ByteBuffer& data) const override {
-        WriteUserDataToFile(offset, length, data);
+    security::core::Status WriteUserData(
+        std::size_t offset,
+        std::size_t length,
+        const security::core::ByteBuffer& data) const override {
+        try {
+            WriteUserDataToFile(offset, length, data);
+            return security::core::Status::Success();
+        } catch (...) {
+            return security::core::detail::StatusFromCurrentException();
+        }
     }
 
-    bool Verify(
+    security::core::Result<bool> Verify(
         security::core::SignatureAlgorithm algorithm,
-        std::string_view public_key_pem,
+        std::string_view id,
         const security::core::ByteBuffer& data,
         const security::core::ByteBuffer& signature) const override {
-        EvpPkeyPtr key = LoadPublicKey(public_key_pem);
-        EvpMdCtxPtr md_ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
-        if (!md_ctx) {
-            ThrowOpenSslError("failed to create verify context");
-        }
+        try {
+            SharedEvpPkeyPtr key = LookupKeyPair(id);
+            EvpMdCtxPtr md_ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+            if (!md_ctx) {
+                ThrowOpenSslError("failed to create verify context");
+            }
 
-        EVP_PKEY_CTX* pkey_ctx = nullptr;
-        if (EVP_DigestVerifyInit(md_ctx.get(), &pkey_ctx, ResolveSignatureDigest(algorithm), nullptr, key.get()) != 1) {
-            ThrowOpenSslError("DigestVerifyInit failed");
-        }
-        SetSm2IdIfNeeded(pkey_ctx, algorithm);
+            EVP_PKEY_CTX* pkey_ctx = nullptr;
+            if (EVP_DigestVerifyInit(md_ctx.get(), &pkey_ctx, ResolveSignatureDigest(algorithm), nullptr, key.get()) != 1) {
+                ThrowOpenSslError("DigestVerifyInit failed");
+            }
+            SetSm2IdIfNeeded(pkey_ctx, algorithm);
 
-        if (EVP_DigestVerifyUpdate(md_ctx.get(), data.data(), data.size()) != 1) {
-            ThrowOpenSslError("DigestVerifyUpdate failed");
-        }
+            if (EVP_DigestVerifyUpdate(md_ctx.get(), data.data(), data.size()) != 1) {
+                ThrowOpenSslError("DigestVerifyUpdate failed");
+            }
 
-        const int rc = EVP_DigestVerifyFinal(md_ctx.get(), signature.data(), signature.size());
-        if (rc == 1) {
-            return true;
+            const int rc = EVP_DigestVerifyFinal(md_ctx.get(), signature.data(), signature.size());
+            if (rc == 1) {
+                return security::core::Result<bool>::Success(true);
+            }
+            if (rc == 0) {
+                return security::core::Result<bool>::Success(false);
+            }
+            ThrowOpenSslError("DigestVerifyFinal failed");
+            return security::core::Result<bool>::Failure(security::core::ErrorCode::CryptoBackendError);
+        } catch (...) {
+            return security::core::detail::ResultFromCurrentException<bool>();
         }
-        if (rc == 0) {
-            return false;
-        }
-        ThrowOpenSslError("DigestVerifyFinal failed");
-        return false;
     }
+
+private:
+    std::string StoreKeyPair(EvpPkeyPtr key) const {
+        if (!key) {
+            throw security::core::detail::StatusException(
+                security::core::ErrorCode::InvalidArgument,
+                "cannot store empty key pair");
+        }
+
+        std::lock_guard<std::mutex> lock(key_pairs_mutex_);
+        const std::string id = "keypair-" + std::to_string(next_key_pair_id_++);
+        key_pairs_.emplace(id, SharedEvpPkeyPtr(key.release(), &EVP_PKEY_free));
+        return id;
+    }
+
+    SharedEvpPkeyPtr LookupKeyPair(std::string_view id) const {
+        std::lock_guard<std::mutex> lock(key_pairs_mutex_);
+        const auto it = key_pairs_.find(std::string(id));
+        if (it == key_pairs_.end()) {
+            throw security::core::detail::StatusException(security::core::ErrorCode::KeyNotFound, std::string(id));
+        }
+        return it->second;
+    }
+
+    mutable std::mutex key_pairs_mutex_;
+    mutable std::unordered_map<std::string, SharedEvpPkeyPtr> key_pairs_;
+    mutable std::uint64_t next_key_pair_id_ = 1;
 };
 
 } // namespace
